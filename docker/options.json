@@ -1,0 +1,21 @@
+{
+    "mqtt": {
+        "mqtt_broker": "core-mosquitto",
+        "mqtt_username": "",
+        "mqtt_password": "",
+        "mqtt_use_tls": false,
+        "mqtt_port": 1883
+    },
+    "cbus": {
+        "cbus_connection_type": "serial",
+        "cbus_connection_string": "/dev/ttyUSB0",
+        "cbus_timesync": 300,
+        "project_file_path": ""
+    },
+    "ga": {
+        "non_dimmable_lights": "",
+        "switches": "",
+        "binary_sensors": "",
+        "ignore": ""
+    }
+}

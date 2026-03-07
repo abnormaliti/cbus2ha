@@ -1,0 +1,33 @@
+# Dockerfile for cbus2ha
+# This bridges C-Bus PCI/CNI to Home Assistant via MQTT
+
+FROM alpine:3
+
+# Install required packages and Python dependencies
+RUN apk add --no-cache \
+    python3 \
+    py3-pip \
+    py3-cffi \
+    py3-paho-mqtt \
+    py3-six \
+    py3-pyserial \
+    tzdata \
+    jq \
+    bash
+
+# Install Python packages that aren't in apk (using --break-system-packages for PEP 668)
+RUN pip3 install --no-cache-dir --break-system-packages \
+    pyserial-asyncio==0.6
+
+# Copy the cbus library and addon files
+COPY . /app
+WORKDIR /app
+
+# Install the cbus package
+RUN python3 setup.py install
+
+# Make run script executable
+RUN chmod a+x /app/run.sh
+
+# Set the entry point to the run script
+CMD ["/app/run.sh"]

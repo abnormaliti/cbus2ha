@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  cbus2ha:
+    container_name: cbus2ha
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: cbus2ha:latest
+    restart: unless-stopped
+    # If connecting to a Home Assistant Mosquitto Add-on running on the same host,
+    # you might need to enable host networking so 'core-mosquitto' or 'localhost' resolves:
+    # network_mode: host
+    environment:
+      # Provide a default timezone (e.g. UTC, Australia/Sydney) if TZ is not set in environment
+      - TZ=${TZ:-Australia/Sydney}
+    volumes:
+      - ./options.json:/data/options.json:ro
+      # Optional: Mount your CBUS project file if you specified one in options.json
+      # - ./my_project.cbz:/data/my_project.cbz:ro
+    devices:
+      # Map the USB serial device for CNI (not needed if using a TCP connection)
+      - /dev/ttyUSB0
