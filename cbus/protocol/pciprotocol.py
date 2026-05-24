@@ -34,7 +34,7 @@ except ImportError:
         raise ImportError('Serial device support requires pyserial-asyncio')
 
 from cbus.common import (
-    Application, CONFIRMATION_CODES, END_COMMAND, add_cbus_checksum)
+    Application, CONFIRMATION_CODES, END_COMMAND, GroupState, add_cbus_checksum)
 from cbus.protocol.application.clock import (
     ClockSAL, ClockRequestSAL, ClockUpdateSAL, clock_update_sal)
 from cbus.protocol.application.lighting import (
@@ -43,7 +43,9 @@ from cbus.protocol.application.lighting import (
 from cbus.protocol.application.status_request import StatusRequestSAL
 from cbus.protocol.base_packet import (
     BasePacket, SpecialServerPacket, SpecialClientPacket)
+from cbus.protocol.cal.extended import ExtendedCAL
 from cbus.protocol.cal.identify import IdentifyCAL
+from cbus.protocol.cal.report import BinaryStatusReport, LevelStatusReport
 from cbus.protocol.cbus_protocol import CBusProtocol
 from cbus.protocol.confirm_packet import ConfirmationPacket
 from cbus.protocol.dm_packet import DeviceManagementPacket
@@ -91,6 +93,7 @@ class PCIProtocol(CBusProtocol):
         self.pci_reset()
         if self._timesync_frequency:
             create_task(self.timesync())
+        create_task(self._initial_level_sync())
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
         self._transport = None
@@ -134,6 +137,12 @@ class PCIProtocol(CBusProtocol):
                         self.on_clock_update(p.source_address, s.val)
                 else:
                     logger.debug(f'hcp: unhandled SAL type: {s!r}')
+        elif isinstance(p, PointToPointPacket):
+            for cal in p:
+                if isinstance(cal, ExtendedCAL):
+                    self._handle_extended_cal(p.unit_address, cal)
+                else:
+                    logger.debug(f'hcp: unhandled PP CAL type: {cal!r}')
         else:
             logger.debug(f'hcp: unhandled other packet: {p!r}')
 
@@ -309,6 +318,75 @@ class PCIProtocol(CBusProtocol):
 
         """
         logger.debug(f'recv: clock update from {source_addr} of {val!r}')
+
+    def _handle_extended_cal(self, source_addr: int, cal: ExtendedCAL) -> None:
+        """
+        Translates an ExtendedCAL status report into lighting events.
+
+        Called when a PointToPointPacket containing an ExtendedCAL is received,
+        which is the response to a level or binary StatusRequestSAL.
+        """
+        report = cal.report
+        block_start = cal.block_start
+
+        if isinstance(report, LevelStatusReport):
+            logger.debug(
+                f'recv: level status report from {source_addr}, '
+                f'block_start={block_start:#x}')
+            for i, level in enumerate(report):
+                group_addr = block_start + i
+                if level is None:
+                    # Group address not assigned or conflicting — skip
+                    continue
+                if level == 0:
+                    self.on_lighting_group_off(source_addr, group_addr)
+                else:
+                    # duration=0 means "current level, no fade"
+                    self.on_lighting_group_ramp(source_addr, group_addr, 0, level)
+
+        elif isinstance(report, BinaryStatusReport):
+            logger.debug(
+                f'recv: binary status report from {source_addr}, '
+                f'block_start={block_start:#x}')
+            for i, state in enumerate(report):
+                group_addr = block_start + i
+                if state == GroupState.ON:
+                    self.on_lighting_group_on(source_addr, group_addr)
+                elif state == GroupState.OFF:
+                    self.on_lighting_group_off(source_addr, group_addr)
+                # GroupState.MISSING and GroupState.ERROR are skipped
+
+        else:
+            logger.debug(f'hcp: unhandled ExtendedCAL report type: {report!r}')
+
+    def request_level_status(self) -> None:
+        """
+        Sends level StatusRequestSAL queries for all 256 group addresses.
+
+        C-Bus group addresses are split into 8 blocks of 32.  A separate
+        query packet is sent for each block.  Units on the network respond
+        with PointToPointPacket / ExtendedCAL / LevelStatusReport packets
+        which are then handled by _handle_extended_cal.
+        """
+        logger.info('Requesting current lighting levels from C-Bus network')
+        for block_start in range(0, 256, 32):
+            self._send(PointToMultipointPacket(sals=StatusRequestSAL(
+                child_application=Application.LIGHTING,
+                level_request=True,
+                group_address=block_start,
+            )))
+
+    async def _initial_level_sync(self) -> None:
+        """
+        Waits for the PCI reset sequence to settle, then polls all group
+        addresses for their current lighting levels so that Home Assistant
+        reflects the live state of the network rather than last-known state.
+        """
+        await sleep(3.0)
+        try:
+            self.request_level_status()
+        except Exception as e:
+            logger.error(f'Initial level sync failed: {e}', exc_info=e)
 
     # other things.
 
