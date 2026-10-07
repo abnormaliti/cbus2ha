@@ -10,6 +10,7 @@
         "cbus_connection_type": "serial",
         "cbus_connection_string": "/dev/ttyUSB0",
         "cbus_timesync": 300,
+        "cbus_link_check_interval": 60,
         "project_file_path": ""
     },
     "ga": {

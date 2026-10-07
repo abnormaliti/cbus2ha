@@ -25,6 +25,7 @@ options:
     cbus_connection_type: "tcp"
     cbus_connection_string: "192.168.1.50:10001"
     cbus_timesync: 300
+    cbus_link_check_interval: 60
     project_file_path: ""
   # CBUS Group Address Modifiers
   ga:
@@ -45,6 +46,7 @@ schema:
     cbus_connection_type: list(tcp|serial)
     cbus_connection_string: str
     cbus_timesync: int(0,)?
+    cbus_link_check_interval: int(0,)?
     project_file_path: str?
   # CBUS Group Address Modifiers
   ga:

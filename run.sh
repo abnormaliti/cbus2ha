@@ -17,6 +17,7 @@ MQTT_PORT=$(jq -r '.mqtt.mqtt_port // 0' $CONFIG_PATH)
 CBUS_CONNECTION_TYPE=$(jq -r '.cbus.cbus_connection_type // "tcp"' $CONFIG_PATH)
 CBUS_CONNECTION_STRING=$(jq -r '.cbus.cbus_connection_string // "192.168.1.50:10001"' $CONFIG_PATH)
 CBUS_TIMESYNC=$(jq -r '.cbus.cbus_timesync // 300' $CONFIG_PATH)
+CBUS_LINK_CHECK_INTERVAL=$(jq -r '.cbus.cbus_link_check_interval // 60' $CONFIG_PATH)
 PROJECT_FILE_PATH=$(jq -r '.cbus.project_file_path // ""' $CONFIG_PATH)
 NON_DIMMABLE_LIGHTS=$(jq -r '.ga.non_dimmable_lights // ""' $CONFIG_PATH)
 SWITCHES=$(jq -r '.ga.switches // ""' $CONFIG_PATH)
@@ -79,6 +80,14 @@ else
     echo "Time synchronization disabled"
     CMQTTD_ARGS="${CMQTTD_ARGS} --timesync 0"
 fi
+
+# Link monitoring
+if [ "${CBUS_LINK_CHECK_INTERVAL}" -gt 0 ]; then
+    echo "Link check interval: ${CBUS_LINK_CHECK_INTERVAL} seconds"
+else
+    echo "Link monitoring disabled"
+fi
+CMQTTD_ARGS="${CMQTTD_ARGS} --link-check-interval ${CBUS_LINK_CHECK_INTERVAL}"
 
 # Project file (optional)
 if [ -n "${PROJECT_FILE_PATH}" ] && [ -e "${PROJECT_FILE_PATH}" ]; then

@@ -10,6 +10,8 @@ This Home Assistant add-on bridges a Clipsal CBus lighting system to Home Assist
 - **Auto-Discovery**: Automatic device discovery in Home Assistant via MQTT
 - **Time Sync**: Optionally synchronize time with the C-Bus network
 - **Customizable Labels**: Support for C-Bus Toolkit project files for friendly device names
+- **Link Monitoring**: Detects a PCI/CNI that has stopped responding and marks all C-Bus entities unavailable
+- **Resilient MQTT**: Reconnects automatically after a broker restart, with no add-on restart needed
 
 ## Configuration
 
@@ -50,6 +52,9 @@ Custom MQTT port. Set to `0` to use defaults:
 
 #### C-Bus Time Sync
 Interval (in seconds) to send time synchronization packets to the C-Bus network. Set to `0` to disable. Default: `300` (5 minutes)
+
+#### C-Bus Link Check Interval
+Seconds of silence from the PCI/CNI before the add-on sends it a probe, a clock broadcast the PCI must acknowledge (or a lighting status request if time sync is disabled). If 2 probes in a row go unanswered, the link is marked down: every C-Bus entity becomes unavailable and the `cbus2ha` connectivity sensor shows disconnected. Any data from the PCI marks the link up again and refreshes all light states. Set to `0` to disable. Default: `60`
 
 #### Project File Path
 Path to a C-Bus Toolkit project backup file (.cbz or .xml) for custom group address labels. If not specified, generic names like "C-Bus Light 001" will be used.
@@ -135,6 +140,12 @@ target:
 - Check C-Bus physical network connections
 - Verify group addresses exist on your C-Bus network
 
+### All C-Bus entities are unavailable
+- The link monitor has found the PCI/CNI silent. The log shows `C-Bus link DOWN`
+- The add-on keeps running and recovers by itself as soon as the PCI answers again
+- **Serial/USB**: Check that the USB device is still present. A PCI that has stopped responding may need to be power-cycled
+- **TCP**: Check the CNI is reachable on the network
+
 ## Technical Details
 
 - Based on libcbus (https://github.com/micolous/cbus)
@@ -142,6 +153,8 @@ target:
 - Supports all 256 C-Bus lighting group addresses (0-255)
 - Implements C-Bus lighting application protocol
 - Time synchronization keeps C-Bus network clock accurate
+- Bridge status (`online`/`offline`) is published, retained, on `homeassistant/binary_sensor/cbus_cmqttd/state`. It is the availability topic for every entity and the MQTT last will
+- Shuts down cleanly on SIGTERM (publishes `offline`, closes MQTT and the PCI connection)
 
 ## License
 

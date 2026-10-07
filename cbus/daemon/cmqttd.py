@@ -22,6 +22,7 @@ from collections import deque
 from dataclasses import dataclass, field
 import json
 import logging
+import signal
 import time
 from typing import Any, BinaryIO, Dict, Optional, Text, TextIO
 
@@ -48,6 +49,21 @@ _TOPIC_SET_SUFFIX = '/set'
 _TOPIC_CONF_SUFFIX = '/config'
 _TOPIC_STATE_SUFFIX = '/state'
 _META_TOPIC = 'homeassistant/binary_sensor/cbus_cmqttd'
+
+# Bridge status, published on the meta device's state topic. 'online' only
+# while the PCI is answering. Used as the availability topic for every entity
+# and as the MQTT last will, so a dead process also shows as 'offline'.
+_STATUS_TOPIC = _META_TOPIC + _TOPIC_STATE_SUFFIX
+_STATUS_ONLINE = 'online'
+_STATUS_OFFLINE = 'offline'
+
+# Link monitor
+_LINK_PROBE_WAIT = 15  # Seconds to wait for the PCI to acknowledge a probe
+_LINK_PROBE_FAILURES = 2  # Unanswered probes in a row before the link is down
+
+# MQTT reconnect backoff (seconds)
+_MQTT_RECONNECT_MIN = 1
+_MQTT_RECONNECT_MAX = 60
 
 # Device type constants
 _DEVICE_TYPE_LIGHT = 'light'
@@ -161,6 +177,7 @@ class CBusHandler(PCIProtocol):
 
     def __init__(self, labels: Optional[Dict[int, Text]], 
                  device_types: Optional[Dict[int, str]] = None, 
+                 link_check_interval: int = 60,
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.labels = (
@@ -176,6 +193,11 @@ class CBusHandler(PCIProtocol):
         self.timeout_watchdog_task = None
         self.queue_lock = None  # Will be initialized as asyncio.Lock when loop is available
         self._queue_running = False
+
+        # Link monitor
+        self.link_check_interval = link_check_interval  # 0 = disabled
+        self.link_up = True  # False once the PCI stops answering probes
+        self.link_monitor_task = None
 
 
     def on_lighting_group_ramp(self, source_addr, group_addr, duration, level):
@@ -220,8 +242,26 @@ class CBusHandler(PCIProtocol):
     def on_clock_request(self, source_addr):
         self.clock_datetime()
 
+    def connection_made(self, transport) -> None:
+        """Called when CBUS connection is made - start link monitor."""
+        super().connection_made(transport)
+        self.start_link_monitor()
+
+    def data_received(self, data: bytes) -> None:
+        """Any data from the PCI proves the link is alive."""
+        was_down = not self.link_up
+        super().data_received(data)
+        if was_down:
+            self._set_link_state(True)
+            # States may have changed while the link was down - resync HA
+            try:
+                self.request_level_status()
+            except Exception as e:
+                logger.error(f"Level sync after link recovery failed: {e}", exc_info=e)
+
     def connection_lost(self, exc: Optional[Exception]) -> None:
         """Called when CBUS connection is lost - stop queue system."""
+        self.stop_link_monitor()
         self.stop_queue_system()
         super().connection_lost(exc)
 
@@ -401,6 +441,74 @@ class CBusHandler(PCIProtocol):
             self.timeout_watchdog_task.cancel()
         logger.info("Queue system stopped")
 
+    # Link monitor methods
+
+    def start_link_monitor(self):
+        """Start the link monitor (if enabled)."""
+        if self.link_check_interval <= 0 or self.link_monitor_task:
+            return
+        self.link_monitor_task = create_task(self._link_monitor())
+        logger.info(f"Link monitor started (check interval {self.link_check_interval}s)")
+
+    def stop_link_monitor(self):
+        """Stop the link monitor."""
+        if self.link_monitor_task:
+            self.link_monitor_task.cancel()
+            self.link_monitor_task = None
+            logger.info("Link monitor stopped")
+
+    async def _link_monitor(self):
+        """
+        Detects a PCI that has gone silent.
+        When nothing has been received for link_check_interval seconds, sends a
+        probe the PCI must acknowledge. After _LINK_PROBE_FAILURES unanswered
+        probes in a row the link is marked down, which makes every entity
+        unavailable in Home Assistant. Any data received marks it up again.
+        """
+        failures = 0
+        while True:
+            await sleep(self.link_check_interval)
+
+            last_rx = self.last_rx_time
+            if last_rx is not None and time.monotonic() - last_rx < self.link_check_interval:
+                failures = 0
+                continue
+
+            probe_time = time.monotonic()
+            try:
+                self.send_link_probe()
+            except Exception as e:
+                logger.warning(f"Could not send link probe: {e}")
+            await sleep(_LINK_PROBE_WAIT)
+
+            last_rx = self.last_rx_time
+            if last_rx is not None and last_rx >= probe_time:
+                failures = 0
+                continue
+
+            failures += 1
+            logger.warning(f"Link probe unanswered ({failures}/{_LINK_PROBE_FAILURES})")
+            if failures >= _LINK_PROBE_FAILURES:
+                self._set_link_state(False)
+
+    def _set_link_state(self, up: bool):
+        """Record a link state change and publish it to Home Assistant."""
+        if self.link_up == up:
+            return
+        self.link_up = up
+        if up:
+            logger.warning("C-Bus link recovered: PCI is answering again")
+        else:
+            logger.error(f"C-Bus link DOWN: PCI has not answered {_LINK_PROBE_FAILURES} "
+                         f"probes in a row (PCI or USB/serial path not responding)")
+        self.publish_availability()
+
+    def publish_availability(self):
+        """Publish the bridge status (online/offline) if MQTT is connected."""
+        if self.mqtt_api is not None:
+            self.mqtt_api.publish_status(
+                _STATUS_ONLINE if self.link_up else _STATUS_OFFLINE)
+
     def on_confirmation(self, code: bytes, success: bool):
         """
         Handle PCI confirmation responses - matches codes to queued commands.
@@ -480,8 +588,62 @@ class CBusHandler(PCIProtocol):
 
 
 class MqttClient(mqtt.Client):
+    """
+    MQTT client driven by AsyncioHelper. paho only reconnects by itself in
+    loop_forever()/loop_start(), so reconnection is handled here.
+    """
+    _reconnect_task = None
+    _stopping = False
+
+    def connect_with_retry(self, host: str, port: int, keepalive: int):
+        """Connect to the broker, retrying in the background if it is unreachable."""
+        self.connect_async(host, port, keepalive)
+        try:
+            self.reconnect()
+        except OSError as e:
+            logger.warning(f"MQTT broker {host}:{port} unreachable: {e}")
+            self.schedule_reconnect()
+
+    def schedule_reconnect(self):
+        """Start the reconnect loop unless it is already running."""
+        if self._stopping:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = create_task(self._reconnect_loop())
+
+    async def _reconnect_loop(self):
+        """Reconnect with exponential backoff until connected or stopping."""
+        delay = _MQTT_RECONNECT_MIN
+        while not self._stopping:
+            await sleep(delay)
+            try:
+                logger.info("Reconnecting to MQTT broker...")
+                if self.reconnect() == mqtt.MQTT_ERR_SUCCESS:
+                    return
+            except OSError as e:
+                logger.warning(f"MQTT reconnect failed: {e}")
+            delay = min(delay * 2, _MQTT_RECONNECT_MAX)
+
+    def stop(self, userdata: CBusHandler):
+        """Clean shutdown: publish offline, then disconnect without reconnecting."""
+        self._stopping = True
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+        # A clean DISCONNECT suppresses the last will, so publish offline first
+        self.publish_status(_STATUS_OFFLINE)
+        self.disconnect()
+
+    def on_disconnect(self, client, userdata: CBusHandler, rc):
+        if self._stopping or rc == mqtt.MQTT_ERR_SUCCESS:
+            return
+        logger.warning(f"Disconnected from MQTT broker (rc={rc}), reconnecting")
+        self.schedule_reconnect()
 
     def on_connect(self, client, userdata: CBusHandler, flags, rc):
+        if rc != mqtt.CONNACK_ACCEPTED:
+            logger.error(f"MQTT broker refused connection: {mqtt.connack_string(rc)}")
+            return
         logger.info('Connected to MQTT broker')
         userdata.mqtt_api = self
         
@@ -508,6 +670,7 @@ class MqttClient(mqtt.Client):
         
         self.subscribe(topics)
         self.publish_all_lights(userdata.labels, userdata.device_types)
+        userdata.publish_availability()
 
     def on_message(self, client, userdata: CBusHandler, msg: mqtt.MQTTMessage):
         """Handle a message from an MQTT subscription."""
@@ -660,6 +823,10 @@ class MqttClient(mqtt.Client):
         payload = json.dumps(payload)
         return super().publish(topic, payload, 1, True)
 
+    def publish_status(self, status: Text):
+        """Publishes the bridge status (online/offline), retained."""
+        return super().publish(_STATUS_TOPIC, status, 1, True)
+
     def publish_all_lights(self, labels: Dict[int, Text], 
                           device_types: Dict[int, str]):
         """Publishes configuration for all devices based on their types."""
@@ -668,7 +835,11 @@ class MqttClient(mqtt.Client):
             '~': _META_TOPIC,
             'name': 'cbus2ha',
             'unique_id': 'cbus2ha',
-            'stat_t': '~' + _TOPIC_STATE_SUFFIX,  # unused
+            'stat_t': '~' + _TOPIC_STATE_SUFFIX,  # bridge status (online/offline)
+            'payload_on': _STATUS_ONLINE,
+            'payload_off': _STATUS_OFFLINE,
+            'device_class': 'connectivity',
+            'entity_category': 'diagnostic',
             'device': {
                 'identifiers': ['cbus2ha'],
                 'sw_version': 'cbus2ha https://github.com/wazza-aus/cbus2ha',
@@ -703,6 +874,7 @@ class MqttClient(mqtt.Client):
             'unique_id': f'cbus_light_{ga}',
             'cmd_t': set_topic(ga),
             'stat_t': state_topic(ga),
+            'avty_t': _STATUS_TOPIC,
             'schema': 'json',
             'brightness': dimmable,  # Key difference!
             'device': {
@@ -730,6 +902,7 @@ class MqttClient(mqtt.Client):
             'unique_id': f'cbus_switch_{ga}',
             'cmd_t': _SWITCH_TOPIC_PREFIX + str(ga) + _TOPIC_SET_SUFFIX,
             'stat_t': _SWITCH_TOPIC_PREFIX + str(ga) + _TOPIC_STATE_SUFFIX,
+            'avty_t': _STATUS_TOPIC,
             'schema': 'json',
             'device': {
                 'identifiers': [f'cbus_switch_{ga}'],
@@ -748,6 +921,7 @@ class MqttClient(mqtt.Client):
             'name': f'{name} (as binary sensor)',
             'unique_id': f'cbus_bin_sensor_{ga}',
             'stat_t': bin_sensor_state_topic(ga),
+            'avty_t': _STATUS_TOPIC,
             'device': {
                 'identifiers': [f'cbus_bin_sensor_{ga}'],
                 'connections': [['cbus_group_address', str(ga)]],
@@ -765,6 +939,7 @@ class MqttClient(mqtt.Client):
             'name': name,
             'unique_id': f'cbus_binary_sensor_{ga}',
             'stat_t': bin_sensor_state_topic(ga),
+            'avty_t': _STATUS_TOPIC,
             'device': {
                 'identifiers': [f'cbus_binary_sensor_{ga}'],
                 'connections': [['cbus_group_address', str(ga)]],
@@ -1021,6 +1196,14 @@ async def _main():
              'time source, or you have another device on the CBus network '
              'providing time services. [default: %(default)s]')
 
+    group = parser.add_argument_group('Link monitoring')
+    group.add_argument(
+        '--link-check-interval', metavar='SECONDS',
+        dest='link_check_interval', type=int, default=60,
+        help='Probe the PCI when nothing has been received for this many '
+             'seconds, and mark all entities unavailable if it stops '
+             'answering (or 0 to disable). [default: %(default)s seconds]')
+
     group = parser.add_argument_group('Label options')
 
     group.add_argument(
@@ -1101,6 +1284,7 @@ async def _main():
             connection_lost_future=connection_lost_future,
             labels=labels,
             device_types=device_types,
+            link_check_interval=option.link_check_interval,
         )
 
     max_retries = 30
@@ -1108,11 +1292,11 @@ async def _main():
     for attempt in range(1, max_retries + 1):
         try:
             if option.serial:
-                _, protocol = await create_serial_connection(
+                transport, protocol = await create_serial_connection(
                     loop, factory, option.serial, baudrate=9600)
             elif option.tcp:
                 addr = option.tcp.split(':', 2)
-                _, protocol = await loop.create_connection(
+                transport, protocol = await loop.create_connection(
                     factory, addr[0], int(addr[1]))
             break
         except OSError as e:
@@ -1142,10 +1326,32 @@ async def _main():
         mqtt_client.tls_set(**tls_args)
         port = option.broker_port or 8883
 
+    mqtt_client.will_set(_STATUS_TOPIC, _STATUS_OFFLINE, 1, True)
     aioh = AsyncioHelper(loop, mqtt_client)
-    mqtt_client.connect(option.broker_address, port, option.broker_keepalive)
+    mqtt_client.connect_with_retry(option.broker_address, port, option.broker_keepalive)
 
-    await connection_lost_future
+    # Running as PID 1 in a container, Python ignores SIGTERM unless a handler
+    # is installed, so a stop used to end in SIGKILL. Shut down cleanly instead.
+    shutdown_future = loop.create_future()
+
+    def request_shutdown(sig_name):
+        if not shutdown_future.done():
+            logger.info(f"Received {sig_name}, shutting down")
+            shutdown_future.set_result(sig_name)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, request_shutdown, sig.name)
+
+    await asyncio.wait([connection_lost_future, shutdown_future],
+                       return_when=asyncio.FIRST_COMPLETED)
+
+    if shutdown_future.done():
+        mqtt_client.stop(protocol)
+        transport.close()  # connection_lost stops the link monitor and queue
+        await sleep(0.5)  # Let the offline status and serial close flush
+        logger.info("Shutdown complete")
+    else:
+        logger.error("Connection to C-Bus lost, exiting")
 
 
 def main():

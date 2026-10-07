@@ -27,6 +27,9 @@ This fork includes extensive enhancements for Home Assistant:
 - **Color Mode Support**: Proper `color_mode` implementation for dimmable and non-dimmable lights
 - **Ramp-Down Fix**: Fixed transition time handling for lights ramping to off
 - **Enhanced Logging**: Comprehensive queue system logging for debugging
+- **Link Monitoring**: Detects a silent PCI/CNI and marks entities unavailable via an availability topic
+- **MQTT Reconnect**: Reconnects automatically after the broker restarts
+- **Clean Shutdown**: Handles SIGTERM instead of being force-killed on stop
 
 ## Installation
 

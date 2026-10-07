@@ -23,6 +23,7 @@ from asyncio import (CancelledError, Future, Lock, create_task,
 from asyncio.transports import WriteTransport
 from datetime import datetime
 import logging
+from time import monotonic
 from typing import Iterable, Optional, Text, Union
 
 from six import int2byte
@@ -81,6 +82,8 @@ class PCIProtocol(CBusProtocol):
         self._timesync_frequency = timesync_frequency
         self._connection_lost_future = connection_lost_future
         self._handle_clock_requests = bool(handle_clock_requests)
+        # monotonic() time of the last byte received from the PCI.
+        self.last_rx_time = None  # type: Optional[float]
 
     def connection_made(self, transport: WriteTransport) -> None:
         """
@@ -94,6 +97,10 @@ class PCIProtocol(CBusProtocol):
         if self._timesync_frequency:
             create_task(self.timesync())
         create_task(self._initial_level_sync())
+
+    def data_received(self, data: bytes) -> None:
+        self.last_rx_time = monotonic()
+        super().data_received(data)
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
         self._transport = None
@@ -374,6 +381,25 @@ class PCIProtocol(CBusProtocol):
                 child_application=Application.LIGHTING,
                 level_request=True,
                 group_address=block_start,
+            )))
+
+    def send_link_probe(self) -> None:
+        """
+        Sends a packet the PCI must acknowledge with a confirmation code, to
+        check the PCI (and the link to it) is alive. Silence afterwards means
+        the PCI or the link is dead.
+
+        Uses a clock broadcast (what timesync already sends periodically),
+        which units accept without replying. If timesync is disabled, falls
+        back to a lighting level status request for group addresses 0-31.
+        """
+        if self._timesync_frequency:
+            self.clock_datetime()
+        else:
+            self._send(PointToMultipointPacket(sals=StatusRequestSAL(
+                child_application=Application.LIGHTING,
+                level_request=True,
+                group_address=0,
             )))
 
     async def _initial_level_sync(self) -> None:

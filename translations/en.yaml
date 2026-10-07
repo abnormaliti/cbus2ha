@@ -31,6 +31,9 @@ configuration:
       cbus_timesync:
         name: "Time Sync Interval"
         description: "Interval in seconds to sync time with C-Bus network (0 = disabled, default: 300)"
+      cbus_link_check_interval:
+        name: "Link Check Interval"
+        description: "Seconds of silence from the PCI before it is probed. If it stops answering, all C-Bus entities become unavailable (0 = disabled, default: 60)"
       project_file_path:
         name: "Project File Path"
         description: "Optional path to C-Bus Toolkit project file (.cbz) for custom device labels"
