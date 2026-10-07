@@ -7,6 +7,7 @@ FROM alpine:3
 RUN apk add --no-cache \
     python3 \
     py3-pip \
+    py3-setuptools \
     py3-cffi \
     py3-paho-mqtt \
     py3-six \
@@ -23,8 +24,11 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 COPY . /app
 WORKDIR /app
 
-# Install the cbus package
-RUN python3 setup.py install
+# Install the cbus package. Newer Alpine Python no longer bundles setuptools
+# and `setup.py install` is deprecated, so install with pip against the apk
+# setuptools; --no-deps keeps the apk-provided dependencies.
+RUN pip3 install --no-cache-dir --break-system-packages --no-deps \
+    --no-build-isolation .
 
 # Make run script executable
 RUN chmod a+x /app/run.sh
