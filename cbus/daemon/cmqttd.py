@@ -1103,13 +1103,28 @@ async def _main():
             device_types=device_types,
         )
 
-    if option.serial:
-        _, protocol = await create_serial_connection(
-            loop, factory, option.serial, baudrate=9600)
-    elif option.tcp:
-        addr = option.tcp.split(':', 2)
-        _, protocol = await loop.create_connection(
-            factory, addr[0], int(addr[1]))
+    max_retries = 30
+    retry_delay = 10  # seconds
+    for attempt in range(1, max_retries + 1):
+        try:
+            if option.serial:
+                _, protocol = await create_serial_connection(
+                    loop, factory, option.serial, baudrate=9600)
+            elif option.tcp:
+                addr = option.tcp.split(':', 2)
+                _, protocol = await loop.create_connection(
+                    factory, addr[0], int(addr[1]))
+            break
+        except OSError as e:
+            if attempt == max_retries:
+                logger.error(
+                    f'Failed to connect to C-Bus after {max_retries} attempts, '
+                    f'giving up: {e}')
+                raise
+            logger.warning(
+                f'C-Bus connection attempt {attempt}/{max_retries} failed: {e} '
+                f'— retrying in {retry_delay}s')
+            await sleep(retry_delay)
 
     mqtt_client = MqttClient(userdata=protocol)
     if option.broker_auth:
