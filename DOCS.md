@@ -154,6 +154,7 @@ target:
 - Implements C-Bus lighting application protocol
 - Time synchronization keeps C-Bus network clock accurate
 - Bridge status (`online`/`offline`) is published, retained, on `homeassistant/binary_sensor/cbus_cmqttd/state`. It is the availability topic for every entity and the MQTT last will
+- Changing a group's type (light, non-dimmable light, switch, binary sensor) or adding it to `ignore` removes the old entity from Home Assistant: discovery configs a group no longer uses are cleared on every connect
 - Shuts down cleanly on SIGTERM (publishes `offline`, closes MQTT and the PCI connection)
 
 ## License

@@ -851,6 +851,10 @@ class MqttClient(mqtt.Client):
 
         for ga in ga_range():
             device_type = get_device_type(ga, device_types)
+
+            # Remove configs left over from a previous type (or from before the
+            # group was ignored), so Home Assistant drops the old entity
+            self._clear_stale_configs(ga, device_type)
             
             # Skip ignored devices completely
             if device_type == _DEVICE_TYPE_IGNORE:
@@ -866,6 +870,22 @@ class MqttClient(mqtt.Client):
                 self._publish_switch_config(ga, name)
             elif device_type == _DEVICE_TYPE_BINARY_SENSOR:
                 self._publish_binary_sensor_config(ga, name)
+
+    def _clear_stale_configs(self, ga: int, device_type: str):
+        """
+        Clear retained discovery configs this group no longer uses.
+        Changing a group's type (e.g. light -> switch) or ignoring it would
+        otherwise leave the old retained config behind, and Home Assistant
+        would keep a stale duplicate entity. An empty retained payload removes
+        both the retained message and the entity.
+        """
+        active = (None if device_type == _DEVICE_TYPE_IGNORE
+                  else conf_topic_for_device(ga, device_type))
+        for topic in (conf_topic(ga),
+                      _SWITCH_TOPIC_PREFIX + str(ga) + _TOPIC_CONF_SUFFIX,
+                      bin_sensor_conf_topic(ga)):
+            if topic != active:
+                super().publish(topic, '', 1, True)
 
     def _publish_light_config(self, ga: int, name: str, dimmable: bool = True):
         """Publish light entity configuration."""
