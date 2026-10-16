@@ -51,7 +51,7 @@ from cbus.protocol.cbus_protocol import CBusProtocol
 from cbus.protocol.confirm_packet import ConfirmationPacket
 from cbus.protocol.dm_packet import DeviceManagementPacket
 from cbus.protocol.error_packet import PCIErrorPacket
-# from cbus.protocol.po_packet import PowerOnPacket
+from cbus.protocol.po_packet import PowerOnPacket
 from cbus.protocol.pm_packet import PointToMultipointPacket
 from cbus.protocol.pp_packet import PointToPointPacket
 from cbus.protocol.reset_packet import ResetPacket
@@ -84,6 +84,8 @@ class PCIProtocol(CBusProtocol):
         self._handle_clock_requests = bool(handle_clock_requests)
         # monotonic() time of the last byte received from the PCI.
         self.last_rx_time = None  # type: Optional[float]
+        # monotonic() time of the last pci_reset() sent to the PCI.
+        self.last_reset_time = None  # type: Optional[float]
 
     def connection_made(self, transport: WriteTransport) -> None:
         """
@@ -116,6 +118,8 @@ class PCIProtocol(CBusProtocol):
                 self.on_pci_cannot_accept_data()
             elif isinstance(p, ConfirmationPacket):
                 self.on_confirmation(p.code, p.success)
+            elif isinstance(p, PowerOnPacket):
+                self.on_pci_power_up()
             else:
                 logger.debug(f'hcp: unhandled SpecialServerPacket: {p!r}')
         elif isinstance(p, PointToMultipointPacket):
@@ -429,6 +433,25 @@ class PCIProtocol(CBusProtocol):
 
         return int2byte(o)
 
+    def tx_backlog(self) -> Optional[int]:
+        """
+        Returns the number of bytes written to the PCI that it has not taken
+        yet, or None if that is unknown (TCP connections).
+
+        This counts what asyncio still buffers plus what the serial driver
+        still holds (TIOCOUTQ). Reading it does not talk to the device, so it
+        is safe to call when the device has stopped responding.
+
+        """
+        transport = self._transport
+        serial = getattr(transport, 'serial', None)
+        if serial is None:
+            return None
+        try:
+            return transport.get_write_buffer_size() + serial.out_waiting
+        except Exception:
+            return None
+
     def _send(self,
               cmd: Union[BasePacket],
               confirmation: bool = True,
@@ -482,6 +505,8 @@ class PCIProtocol(CBusProtocol):
         #
         # MMI calls aren't needed to get events from light switches and other
         # device on the network.
+
+        self.last_reset_time = monotonic()
 
         # full system reset
         for _ in range(3):

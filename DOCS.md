@@ -11,6 +11,7 @@ This Home Assistant add-on bridges a Clipsal CBus lighting system to Home Assist
 - **Time Sync**: Optionally synchronize time with the C-Bus network
 - **Customizable Labels**: Support for C-Bus Toolkit project files for friendly device names
 - **Link Monitoring**: Detects a PCI/CNI that has stopped responding and marks all C-Bus entities unavailable
+- **PCI Re-initialisation**: Sets up a PCI again after it reboots or goes silent, without restarting the add-on
 - **Resilient MQTT**: Reconnects automatically after a broker restart, with no add-on restart needed
 
 ## Configuration
@@ -54,7 +55,7 @@ Custom MQTT port. Set to `0` to use defaults:
 Interval (in seconds) to send time synchronization packets to the C-Bus network. Set to `0` to disable. Default: `300` (5 minutes)
 
 #### C-Bus Link Check Interval
-Seconds of silence from the PCI/CNI before the add-on sends it a probe, a clock broadcast the PCI must acknowledge (or a lighting status request if time sync is disabled). If 2 probes in a row go unanswered, the link is marked down: every C-Bus entity becomes unavailable and the `cbus2ha` connectivity sensor shows disconnected. Any data from the PCI marks the link up again and refreshes all light states. Set to `0` to disable. Default: `60`
+Seconds of silence from the PCI/CNI before the add-on sends it a probe, a clock broadcast the PCI must acknowledge (or a lighting status request if time sync is disabled). If 2 probes in a row go unanswered, the link is marked down: every C-Bus entity becomes unavailable and the `cbus2ha` connectivity sensor shows disconnected. Any data from the PCI marks the link up again and refreshes all light states. While the link is down, the add-on re-sends the PCI initialisation (reset and interface options) when the link goes down and every 4 unanswered probes after that, about every 5 minutes with the default interval. Set to `0` to disable. Default: `60`
 
 #### Project File Path
 Path to a C-Bus Toolkit project backup file (.cbz or .xml) for custom group address labels. If not specified, generic names like "C-Bus Light 001" will be used.
@@ -143,7 +144,9 @@ target:
 ### All C-Bus entities are unavailable
 - The link monitor has found the PCI/CNI silent. The log shows `C-Bus link DOWN`
 - The add-on keeps running and recovers by itself as soon as the PCI answers again
-- **Serial/USB**: Check that the USB device is still present. A PCI that has stopped responding may need to be power-cycled
+- A PCI that reboots (for example after a power-cycle) loses its interface settings. The add-on initialises it again by itself: on the PCI's power-up notification, and every few minutes while the link is down (`Re-initialising PCI` in the log). There is no need to restart the add-on
+- **Serial/USB**: Check that the USB device is still present. The `C-Bus link DOWN` and `Re-initialising PCI` lines report how many bytes are waiting to be sent to the PCI. If that number keeps growing, the USB/serial device has stopped accepting data, and re-initialising won't help: reset or re-plug the USB device. If it stays at 0, the PCI takes data but doesn't answer, so power-cycle the PCI
+- **Serial/USB**: Avoid stopping or restarting the add-on while the link is down. Closing a USB-serial port whose device has stopped responding can hang, and on some USB host controllers it takes the controller down
 - **TCP**: Check the CNI is reachable on the network
 
 ## Technical Details

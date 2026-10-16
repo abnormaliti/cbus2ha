@@ -60,6 +60,8 @@ _STATUS_OFFLINE = 'offline'
 # Link monitor
 _LINK_PROBE_WAIT = 15  # Seconds to wait for the PCI to acknowledge a probe
 _LINK_PROBE_FAILURES = 2  # Unanswered probes in a row before the link is down
+_LINK_REINIT_EVERY = 4  # While the link is down, re-initialise the PCI every this many unanswered probes
+_POWER_UP_SETTLE = 10  # Seconds after a PCI reset in which power-up notifications are ignored
 
 # MQTT reconnect backoff (seconds)
 _MQTT_RECONNECT_MIN = 1
@@ -241,6 +243,17 @@ class CBusHandler(PCIProtocol):
 
     def on_clock_request(self, source_addr):
         self.clock_datetime()
+
+    def on_pci_power_up(self):
+        """The PCI has rebooted and lost its settings - initialise it again."""
+        super().on_pci_power_up()
+        last_reset = self.last_reset_time
+        if last_reset is not None and time.monotonic() - last_reset < _POWER_UP_SETTLE:
+            # The PCI sends the notification twice, and may send it after our
+            # own reset: only act once.
+            return
+        self.reinitialise_pci("PCI power-up notification")
+        create_task(self._initial_level_sync())
 
     def connection_made(self, transport) -> None:
         """Called when CBUS connection is made - start link monitor."""
@@ -490,6 +503,36 @@ class CBusHandler(PCIProtocol):
             logger.warning(f"Link probe unanswered ({failures}/{_LINK_PROBE_FAILURES})")
             if failures >= _LINK_PROBE_FAILURES:
                 self._set_link_state(False)
+                if (failures - _LINK_PROBE_FAILURES) % _LINK_REINIT_EVERY == 0:
+                    self.reinitialise_pci(f"{failures} probes unanswered")
+
+    def reinitialise_pci(self, reason: str):
+        """
+        Re-sends the PCI initialisation done on connect (reset, application
+        address, interface options) without closing the connection.
+
+        A PCI that has rebooted comes back in basic mode with its interface
+        options cleared, and sends no bus traffic or confirmations until it is
+        initialised again. Reopening the port would also do that, but closing a
+        USB-serial port whose device has stopped responding can hang, and can
+        take the USB host controller down with it.
+        """
+        logger.warning(f"Re-initialising PCI ({reason}){self._tx_backlog_note()}")
+        try:
+            self.pci_reset()
+        except Exception as e:
+            logger.error(f"PCI re-initialisation failed: {e}", exc_info=e)
+
+    def _tx_backlog_note(self) -> str:
+        """
+        Describes data the PCI has not taken yet, for log messages. A backlog
+        that keeps growing means the USB/serial device is not accepting data;
+        none means the PCI takes data but does not answer.
+        """
+        backlog = self.tx_backlog()
+        if backlog is None:
+            return ""
+        return f"; {backlog} bytes waiting to be sent to the PCI"
 
     def _set_link_state(self, up: bool):
         """Record a link state change and publish it to Home Assistant."""
@@ -500,7 +543,8 @@ class CBusHandler(PCIProtocol):
             logger.warning("C-Bus link recovered: PCI is answering again")
         else:
             logger.error(f"C-Bus link DOWN: PCI has not answered {_LINK_PROBE_FAILURES} "
-                         f"probes in a row (PCI or USB/serial path not responding)")
+                         f"probes in a row (PCI or USB/serial path not responding)"
+                         f"{self._tx_backlog_note()}")
         self.publish_availability()
 
     def publish_availability(self):
@@ -1366,6 +1410,10 @@ async def _main():
                        return_when=asyncio.FIRST_COMPLETED)
 
     if shutdown_future.done():
+        if not protocol.link_up:
+            logger.warning(
+                "Shutting down while the C-Bus link is down: if the USB-serial "
+                "device has stopped responding, closing the port may hang")
         mqtt_client.stop(protocol)
         transport.close()  # connection_lost stops the link monitor and queue
         await sleep(0.5)  # Let the offline status and serial close flush
